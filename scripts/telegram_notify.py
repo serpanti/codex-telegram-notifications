@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 import sys
 import urllib.parse
@@ -141,9 +142,44 @@ def excerpt(value, limit):
     return clean if len(clean) <= limit else clean[: limit - 1].rstrip() + "…"
 
 
+def project_name(event):
+    cwd = event.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return "Не указан"
+    directory = Path(cwd).expanduser()
+    if not directory.is_absolute():
+        return excerpt(directory.name, 80) or "Не указан"
+    try:
+        for candidate in (directory, *directory.parents):
+            if (candidate / ".git").exists():
+                return excerpt(candidate.name, 80) or "Не указан"
+    except OSError:
+        pass
+    return excerpt(directory.name, 80) or "Не указан"
+
+
+def task_excerpt(value):
+    if not isinstance(value, str):
+        return ""
+    clean = re.sub(r"<in-app-browser-context\b[^>]*>.*?</in-app-browser-context>", "", value, flags=re.DOTALL | re.IGNORECASE)
+    if "## My request:" in clean:
+        clean = clean.rsplit("## My request:", 1)[1]
+    elif clean.lstrip().startswith("# Files mentioned by the user:"):
+        return "Сообщение с вложением"
+    clean = re.sub(r"<image\b[^>]*>.*?</image>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+    lines = clean.strip().splitlines()
+    if lines and lines[0].startswith("Задача:"):
+        for index in range(len(lines) - 1, 0, -1):
+            if lines[index].startswith("Итог:") and any(line.strip() for line in lines[index + 1:]):
+                clean = "\n".join(lines[index + 1:])
+                break
+    return excerpt(clean, 450)
+
+
 def notification_text(event, kind):
     if not isinstance(event, dict):
         return None
+    project = project_name(event)
     if kind == "main":
         if event.get("type") != "agent-turn-complete":
             return None
@@ -151,23 +187,19 @@ def notification_text(event, kind):
         task = ""
         if isinstance(inputs, list):
             for item in inputs:
-                task = excerpt(item, 800) or task
-        answer = excerpt(event.get("last-assistant-message"), 2000)
-        lines = ["✅ Codex: ход завершён"]
-        if task:
-            lines.append(f"Задача: {task}")
-        if answer:
-            lines.append(f"Итог: {answer}")
+                task = task_excerpt(item) or task
+        answer = excerpt(event.get("last-assistant-message"), 900)
+        lines = ["📌 Codex: ход завершён", f"Проект: {project}", f"Задача: {task or 'Не указана'}", f"Итог: {answer or 'Ответ не указан'}"]
         return "\n".join(lines)
     if event.get("hook_event_name") != kind:
         return None
     if kind == "SubagentStop":
-        result = excerpt(event.get("last_assistant_message"), 2200)
-        return "🤖 Codex: подагент завершил ход" + (f"\nРезультат: {result}" if result else "")
+        result = excerpt(event.get("last_assistant_message"), 900)
+        return "\n".join(("🤖 Codex: подагент завершил ход", f"Проект: {project}", f"Итог: {result or 'Ответ не указан'}"))
     if kind == "PermissionRequest":
         tool = event.get("tool_input")
-        description = excerpt(tool.get("description") if isinstance(tool, dict) else None, 1000) or excerpt(event.get("tool_name"), 160)
-        return "⚠️ Codex: требуется разрешение" + (f"\nДействие: {description}" if description else "")
+        description = excerpt(tool.get("description") if isinstance(tool, dict) else None, 450) or excerpt(event.get("tool_name"), 160) or "Действие не указано"
+        return "\n".join(("⚠️ Codex: требуется разрешение", f"Проект: {project}", f"Действие: {description}", "Ожидается: решение в Codex"))
     if kind == "PreToolUse":
         tool_name = event.get("tool_name")
         if not isinstance(tool_name, str) or not re.search(r"(^|[._])request_user_input(_async)?$", tool_name):
@@ -175,8 +207,8 @@ def notification_text(event, kind):
         tool = event.get("tool_input")
         questions = tool.get("questions") if isinstance(tool, dict) else None
         first = questions[0] if isinstance(questions, list) and questions else None
-        question = excerpt(first.get("title") if isinstance(first, dict) else None, 1000)
-        return "❓ Codex: нужен ответ" + (f"\nВопрос: {question}" if question else "")
+        question = excerpt(first.get("title") if isinstance(first, dict) else None, 450) or "Вопрос не указан"
+        return "\n".join(("❓ Codex: нужен ответ", f"Проект: {project}", f"Вопрос: {question}", "Ожидается: ответ в Codex"))
     return None
 
 
