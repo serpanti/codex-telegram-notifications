@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Telegram Notifications"
+  short_description: "Контекстные уведомления Codex через Telegram-бота"
+  default_prompt: "Используй $codex-telegram-notifications, чтобы настроить контекстные уведомления Codex в Telegram."

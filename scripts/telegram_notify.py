@@ -1,0 +1,184 @@
+"""Shared, cross-platform logic for Codex Telegram notifications."""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+SERVICE = "codex-telegram-notifications"
+ACCOUNT = "bot"
+ALLOWED_BACKENDS = {
+    "win32": {"keyring.backends.Windows.WinVaultKeyring"},
+    "darwin": {"keyring.backends.macOS.Keyring"},
+    "linux": {
+        "keyring.backends.SecretService.Keyring",
+        "keyring.backends.kwallet.DBusKeyring",
+        "keyring.backends.kwallet.DBusKeyringKWallet4",
+    },
+}
+TOKEN_PATTERN = re.compile(r"[0-9]{1,20}:[A-Za-z0-9_-]{1,256}")
+SENSITIVE_PATTERNS = (
+    re.compile(r"(?<![A-Za-z0-9_-])[0-9]{6,20}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])"),
+    re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{12,}", re.IGNORECASE),
+    re.compile(r"\b(?:password|passwd|api[_-]?key|token|secret)\s*[:=]\s*[^\s,;]{4,}", re.IGNORECASE),
+)
+
+
+def secure_keyring():
+    try:
+        import keyring
+    except ImportError as exc:
+        raise RuntimeError("Install keyring in this Python: python -m pip install keyring") from exc
+    backend = keyring.get_keyring()
+    identity = f"{type(backend).__module__}.{type(backend).__name__}"
+    allowed = ALLOWED_BACKENDS.get(sys.platform, set())
+    if identity not in allowed:
+        raise RuntimeError(
+            f"No approved OS credential backend for {sys.platform} ({identity}). "
+            "Configure the OS keychain; plaintext and custom backends are refused."
+        )
+    return keyring
+
+
+def valid_chat_id(value):
+    return isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value) is not None
+
+
+def valid_token(value):
+    return isinstance(value, str) and TOKEN_PATTERN.fullmatch(value) is not None
+
+
+def redact_sensitive(value):
+    for pattern in SENSITIVE_PATTERNS:
+        value = pattern.sub("[REDACTED]", value)
+    return value
+
+
+def read_credential():
+    raw = secure_keyring().get_password(SERVICE, ACCOUNT)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not valid_token(data.get("token")) or not valid_chat_id(data.get("chat_id")):
+            raise ValueError("invalid credential")
+        return data
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Stored Telegram credential is invalid.") from exc
+
+
+def save_credential(token, chat_id):
+    if not valid_token(token):
+        raise ValueError("Bot token has an invalid format.")
+    if not valid_chat_id(chat_id):
+        raise ValueError("Use a numeric chat ID.")
+    secure_keyring().set_password(SERVICE, ACCOUNT, json.dumps({"token": token, "chat_id": chat_id}))
+
+
+def remove_credential():
+    ring = secure_keyring()
+    if ring.get_password(SERVICE, ACCOUNT) is not None:
+        ring.delete_password(SERVICE, ACCOUNT)
+
+
+def api_request(token, method, *, body=None, query=None, transport=None):
+    if not valid_token(token):
+        raise RuntimeError("Telegram bot token has an invalid format.")
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json; charset=utf-8"} if data is not None else {}, method="POST" if data is not None else "GET")
+    try:
+        opener = transport or urllib.request.urlopen
+        with opener(request, timeout=8) as response:
+            result = json.load(response)
+    except Exception:
+        raise RuntimeError(f"Telegram {method} failed; check the token, bot state, and network.") from None
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError(f"Telegram rejected {method}; check the bot configuration.")
+    return result.get("result")
+
+
+def discover_private_chats(token, transport=None):
+    webhook = api_request(token, "getWebhookInfo", transport=transport)
+    if not isinstance(webhook, dict):
+        raise RuntimeError("Unexpected Telegram webhook response.")
+    if webhook.get("url"):
+        raise RuntimeError("This bot has an active webhook; getUpdates discovery is unavailable.")
+    updates = api_request(token, "getUpdates", query={"limit": 100, "timeout": 0}, transport=transport)
+    if not isinstance(updates, list):
+        raise RuntimeError("Unexpected Telegram updates response.")
+    chats = {}
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        message = update.get("message")
+        chat = message.get("chat") if isinstance(message, dict) else None
+        if not isinstance(chat, dict) or chat.get("type") != "private":
+            continue
+        chat_id = str(chat.get("id", ""))
+        if not valid_chat_id(chat_id):
+            continue
+        name = " ".join(str(chat.get(k, "")) for k in ("first_name", "last_name")).strip()
+        name = "".join(c for c in name if c.isprintable())[:80]
+        username = chat.get("username")
+        if isinstance(username, str) and re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+            name = f"{name} @{username}".strip()
+        chats[chat_id] = name
+    return chats
+
+
+def excerpt(value, limit):
+    if not isinstance(value, str):
+        return ""
+    clean = redact_sensitive(" ".join(value.split()))
+    return clean if len(clean) <= limit else clean[: limit - 1].rstrip() + "…"
+
+
+def notification_text(event, kind):
+    if not isinstance(event, dict):
+        return None
+    if kind == "main":
+        if event.get("type") != "agent-turn-complete":
+            return None
+        inputs = event.get("input-messages", [])
+        task = ""
+        if isinstance(inputs, list):
+            for item in inputs:
+                task = excerpt(item, 800) or task
+        answer = excerpt(event.get("last-assistant-message"), 2000)
+        lines = ["✅ Codex: ход завершён"]
+        if task:
+            lines.append(f"Задача: {task}")
+        if answer:
+            lines.append(f"Итог: {answer}")
+        return "\n".join(lines)
+    if event.get("hook_event_name") != kind:
+        return None
+    if kind == "SubagentStop":
+        result = excerpt(event.get("last_assistant_message"), 2200)
+        return "🤖 Codex: подагент завершил ход" + (f"\nРезультат: {result}" if result else "")
+    if kind == "PermissionRequest":
+        tool = event.get("tool_input")
+        description = excerpt(tool.get("description") if isinstance(tool, dict) else None, 1000) or excerpt(event.get("tool_name"), 160)
+        return "⚠️ Codex: требуется разрешение" + (f"\nДействие: {description}" if description else "")
+    if kind == "PreToolUse":
+        tool_name = event.get("tool_name")
+        if not isinstance(tool_name, str) or not re.search(r"(^|[._])request_user_input(_async)?$", tool_name):
+            return None
+        tool = event.get("tool_input")
+        questions = tool.get("questions") if isinstance(tool, dict) else None
+        first = questions[0] if isinstance(questions, list) and questions else None
+        question = excerpt(first.get("title") if isinstance(first, dict) else None, 1000)
+        return "❓ Codex: нужен ответ" + (f"\nВопрос: {question}" if question else "")
+    return None
+
+
+def send_message(credential, message, transport=None):
+    api_request(credential["token"], "sendMessage", body={"chat_id": credential["chat_id"], "text": message, "link_preview_options": {"is_disabled": True}}, transport=transport)

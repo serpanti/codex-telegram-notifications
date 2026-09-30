@@ -1,0 +1,2 @@
+keyring==25.7.0
+tomlkit==0.15.1

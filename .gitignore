@@ -8,4 +8,3 @@ config.toml
 *.bak-*
 *.pem
 *.key
-
