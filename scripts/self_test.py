@@ -130,6 +130,40 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(payload["chat_id"], "23456")
         self.assertTrue(payload["link_preview_options"]["is_disabled"])
 
+    def test_structured_notification_uses_git_project_and_clean_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Path(root) / "sample-project"
+            child = project / "src"
+            child.mkdir(parents=True)
+            (project / ".git").mkdir()
+            event = {
+                "type": "agent-turn-complete",
+                "cwd": str(child),
+                "input-messages": ["# Files mentioned by the user:\n\n## image.png\nImage attachment: true\n\n## My request:\nИсправь уведомления"],
+                "last-assistant-message": "Формат обновлён.",
+            }
+            message = core.notification_text(event, "main")
+            self.assertEqual(message.splitlines(), [
+                "📌 Codex: ход завершён",
+                "Проект: sample-project",
+                "Задача: Исправь уведомления",
+                "Итог: Формат обновлён.",
+            ])
+            self.assertNotIn("image.png", message)
+        pasted_notification = "Задача: # Files mentioned by the user: ...\nИтог: Старый результат.\nВот пример текста, который приходит; исправь формат."
+        self.assertEqual(core.task_excerpt(pasted_notification), "Вот пример текста, который приходит; исправь формат.")
+
+    def test_attention_notifications_include_project_and_action(self):
+        approval = {"hook_event_name": "PermissionRequest", "cwd": "project", "tool_input": {"description": "Разрешить запись"}}
+        message = core.notification_text(approval, "PermissionRequest")
+        self.assertIn("Проект: project", message)
+        self.assertIn("Действие: Разрешить запись", message)
+        self.assertIn("Ожидается: решение в Codex", message)
+        question = {"hook_event_name": "PreToolUse", "cwd": "project", "tool_name": "request_user_input_async", "tool_input": {"questions": [{"title": "Какой вариант выбрать?"}]}}
+        message = core.notification_text(question, "PreToolUse")
+        self.assertIn("Вопрос: Какой вариант выбрать?", message)
+        self.assertIn("Ожидается: ответ в Codex", message)
+
     def test_hook_context_and_preview(self):
         event = {"hook_event_name": "PermissionRequest", "tool_input": {"description": "Разрешить проверку"}}
         self.assertIn("Разрешить проверку", core.notification_text(event, "PermissionRequest"))
@@ -188,11 +222,16 @@ class TelegramTests(unittest.TestCase):
                 self.assertEqual(backup.read_text(encoding="utf-8"), '# keep this comment\ntheme = "dark"\nnotify = ["old-notifier", "flag"]\n')
                 updated = tomllib.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(updated["theme"], "dark")
+                self.assertEqual(set(updated["hooks"]), {"SubagentStop", "PermissionRequest", "PreToolUse"})
                 command = updated["notify"]
                 self.assertEqual(json.loads(base64.b64decode(command[-1])), ["old-notifier", "flag"])
                 configure.install_config()
                 again = tomllib.loads(path.read_text(encoding="utf-8"))["notify"]
                 self.assertEqual(json.loads(base64.b64decode(again[-1])), ["old-notifier", "flag"])
+                configure.install_hooks()
+                final = tomllib.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(final["notify"], again)
+                self.assertTrue(all(len(groups) == 1 for groups in final["hooks"].values()))
 
 
 if __name__ == "__main__":

@@ -18,6 +18,12 @@ from datetime import datetime, timezone
 
 from telegram_notify import discover_private_chats, read_credential, remove_credential, save_credential, secure_keyring, valid_chat_id, valid_token
 
+HOOKS = (
+    ("SubagentStop", ".*"),
+    ("PermissionRequest", ".*"),
+    ("PreToolUse", ".*request_user_input(_async)?$"),
+)
+
 
 def python_command(*args):
     return [sys.executable, str(Path(__file__).with_name("notify.py")), *args]
@@ -45,6 +51,71 @@ def print_config(chain_existing):
         encoded = base64.b64encode(json.dumps(previous).encode("utf-8")).decode("ascii")
         command.extend(["--chain-command", encoded])
     print("notify = " + json.dumps(command, ensure_ascii=False))
+
+
+def hook_command(event):
+    parts = python_command("hook", "--hook-event", event)
+    return subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
+
+
+def hook_blocks(event, matcher):
+    return "\n".join((
+        f"[[hooks.{event}]]",
+        "matcher = " + json.dumps(matcher),
+        f"[[hooks.{event}.hooks]]",
+        'type = "command"',
+        "command = " + json.dumps(hook_command(event), ensure_ascii=False),
+        "async = true",
+        "timeout = 15",
+    ))
+
+
+def append_hooks(text):
+    parsed = tomllib.loads(text)
+    existing = parsed.get("hooks", {})
+    if not isinstance(existing, dict):
+        raise RuntimeError("Existing hooks configuration is invalid; config was not changed.")
+    missing = []
+    for event, matcher in HOOKS:
+        groups = existing.get(event, [])
+        if not isinstance(groups, list):
+            raise RuntimeError(f"Existing {event} hooks are invalid; config was not changed.")
+        if not any(
+            isinstance(group, dict) and any(
+                isinstance(handler, dict) and handler.get("command") == hook_command(event)
+                for handler in group.get("hooks", [])
+            ) for group in groups
+        ):
+            missing.append(hook_blocks(event, matcher))
+    if not missing:
+        return text
+    newline = "\r\n" if "\r\n" in text else "\n"
+    separator = newline + newline if text.strip() else ""
+    blocks = [block.replace("\n", newline) for block in missing]
+    return text.rstrip("\r\n") + separator + (newline + newline).join(blocks) + newline
+
+
+def write_config(path, new_text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = path.with_name(path.name + ".bak-" + stamp)
+        shutil.copy2(path, backup)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, prefix=".config-telegram-", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(new_text)
+        if path.exists():
+            temporary.chmod(stat.S_IMODE(path.stat().st_mode))
+        elif os.name != "nt":
+            temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return path, backup
 
 
 def install_config():
@@ -81,49 +152,28 @@ def install_config():
     else:
         document["notify"] = updated
         new_text = tomlkit.dumps(document)
+    new_text = append_hooks(new_text)
     with io.BytesIO(new_text.encode("utf-8")) as stream:
         parsed = tomllib.load(stream)
     if parsed.get("notify") != updated:
         raise RuntimeError("Generated config did not validate; config was not changed.")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
-    if path.exists():
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup = path.with_name(path.name + ".bak-" + stamp)
-        shutil.copy2(path, backup)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, prefix=".config-telegram-", suffix=".tmp", delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(new_text)
-        if path.exists():
-            temporary.chmod(stat.S_IMODE(path.stat().st_mode))
-        elif os.name != "nt":
-            temporary.chmod(0o600)
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    return path, backup
+    return write_config(path, new_text)
+
+
+def install_hooks():
+    path = config_path()
+    original_text = path.read_bytes().decode("utf-8") if path.exists() else ""
+    new_text = append_hooks(original_text)
+    if new_text == original_text:
+        return path, None
+    tomllib.loads(new_text)
+    return write_config(path, new_text)
 
 
 def print_hooks():
-    hooks = (
-        ("SubagentStop", ".*"),
-        ("PermissionRequest", ".*"),
-        ("PreToolUse", ".*request_user_input(_async)?$"),
-    )
-    for event, matcher in hooks:
-        parts = python_command("hook", "--hook-event", event)
-        command = subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
-        print(f"[[hooks.{event}]]")
-        print("matcher = " + json.dumps(matcher))
-        print(f"[[hooks.{event}.hooks]]")
-        print('type = "command"')
-        print("command = " + json.dumps(command, ensure_ascii=False))
-        print("async = true")
-        print("timeout = 8\n")
+    for event, matcher in HOOKS:
+        print(hook_blocks(event, matcher) + "\n")
 
 
 def configure(chat_id):
@@ -149,7 +199,7 @@ def configure(chat_id):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "configure", "status", "print-config", "print-hooks", "remove"))
+    parser.add_argument("action", choices=("install", "install-hooks", "configure", "status", "print-config", "print-hooks", "remove"))
     parser.add_argument("--chat-id")
     parser.add_argument("--chain-existing", action="store_true")
     args = parser.parse_args(argv)
@@ -162,7 +212,14 @@ def main(argv=None):
             print(f"Codex notifications enabled in {path}.")
             if backup:
                 print(f"Previous config saved at {backup}.")
+            print("Review and trust the new hooks in Codex /hooks after restart.")
             print("Restart Codex to apply the change.")
+        elif args.action == "install-hooks":
+            path, backup = install_hooks()
+            print(f"Telegram hooks configured in {path}.")
+            if backup:
+                print(f"Previous config saved at {backup}.")
+            print("Restart Codex, then review and trust these hooks in /hooks.")
         elif args.action == "configure":
             configure(args.chat_id)
         elif args.action == "status":

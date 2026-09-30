@@ -7,7 +7,7 @@ metadata:
 
 # Codex Telegram Notifications
 
-This skill uses one Python implementation on Windows, macOS, and Linux. A completed main turn sends excerpts of the latest user request and last assistant message. Optional hooks send the subagent result, approval description, or input question. These are excerpts, not generated summaries. A completed turn does not prove the task succeeded.
+This skill uses one Python implementation on Windows, macOS, and Linux. A completed main turn sends a structured message with the project, latest task, and result. Hooks send separate messages when Codex requests approval or structured user input, and when a subagent finishes. The task and result are excerpts, not generated summaries. A completed turn does not prove the task succeeded.
 
 ## Privacy and prerequisites
 
@@ -19,24 +19,24 @@ This skill uses one Python implementation on Windows, macOS, and Linux. A comple
 
 ## Configure
 
-Use [references/setup.md](references/setup.md) when installing or troubleshooting the runtime. First check for Python 3.11+; install it when needed. The user creates a bot and sends `/start` in the intended private chat. Then **one interactive command** completes the normal setup: `python <skill-dir>/scripts/bootstrap.py` (use `python3` on macOS/Linux, or an absolute 3.11+ interpreter path). Bootstrap installs dependencies in its own environment, asks for the token in a hidden prompt, discovers and confirms the private chat ID, backs up `config.toml`, and adds the root `notify` command. It chains a prior `notify` automatically and preserves unrelated TOML settings. Use `--chat-id <numeric-id>` only if discovery is unavailable. Restart Codex afterward.
+Use [references/setup.md](references/setup.md) when installing or troubleshooting the runtime. First check for Python 3.11+; install it when needed. The user creates a bot and sends `/start` in the intended private chat. Then **one interactive command** completes the normal setup: `python <skill-dir>/scripts/bootstrap.py` (use `python3` on macOS/Linux, or an absolute 3.11+ interpreter path). Bootstrap installs dependencies in its own environment, asks for the token in a hidden prompt, discovers and confirms the private chat ID, backs up `config.toml`, and adds the root `notify` command plus notification hooks. It chains a prior `notify` automatically and preserves unrelated TOML settings. Use `--chat-id <numeric-id>` only if discovery is unavailable. Restart Codex and review and trust the new hook definitions through `/hooks`.
 
-When acting as an agent, perform all setup steps possible without the secret; use `bootstrap.py --runtime-only` if the user must run the final interactive command in their own terminal. Do not ask for the token in chat or put it into a command. Bootstrap's `--check` verifies an existing runtime without installing or prompting. The generated `notify` command uses the isolated Python's absolute path. For manual repair, `configure.py` also exposes `configure`, `status`, `print-config`, `print-hooks`, and `remove` actions.
+When acting as an agent, perform all setup steps possible without the secret; use `bootstrap.py --runtime-only` if the user must run the final interactive command in their own terminal. Do not ask for the token in chat or put it into a command. Bootstrap's `--check` verifies an existing runtime without installing or prompting. The generated `notify` command uses the isolated Python's absolute path. For an existing installation, `configure.py install-hooks` adds missing hook definitions without re-entering the token or changing the existing `notify`. Other repair actions are `configure`, `status`, `print-config`, `print-hooks`, and `remove`.
 
 After restarting Codex, inspect the effective root `notify`. Codex may wrap this command with `codex-computer-use` and place the Telegram command in `--previous-notify`; this preserves forwarding rather than replacing the notifier. On Windows, Credential Manager is tied to the user's logon context. A `status` check from an isolated agent shell can report no credential even when the normal interactive user session has it. In that case, check `status` in the same interactive session used for setup and confirm delivery with a normal completed turn before changing the credential or config.
 
-The notifier includes at most 800 characters of the latest nonempty user message and 2,000 characters of the last assistant message. Missing fields are omitted; other notification types are ignored.
+The notifier uses the Git root name when `cwd` is inside a repository, otherwise the working directory name. It removes known attachment and browser metadata wrappers from the task excerpt, includes at most 450 task characters and 900 result characters, and labels missing fields explicitly. Other notification types are ignored.
 
 A token alone cannot identify a chat. Discovery reads at most 100 pending updates **without an offset**, so it does not confirm or discard them. It cannot work with an active webhook, another polling client consuming updates, or no recent private message. Never delete a webhook just to discover an ID. Telegram keeps undelivered updates for at most 24 hours.
 
-## Optional hooks
+## Approval and input hooks
 
-Run `<skill-python> <skill-dir>/scripts/configure.py print-hooks` and add the printed definitions to user `config.toml`. Review and trust them through Codex `/hooks`. Hook inputs arrive through stdin. `PreToolUse` only covers structured `request_user_input` and `request_user_input_async`; ordinary assistant questions have no separate event. If a Codex release skips asynchronous hooks, make only those hook definitions synchronous after observing the issue. The scripts make no approval decision.
+The installer adds `PermissionRequest`, `PreToolUse`, and `SubagentStop` hooks. For an existing installation, run `<skill-python> <skill-dir>/scripts/configure.py install-hooks`. Review and trust new definitions through Codex `/hooks`; until trusted, Codex skips them. `print-hooks` shows the exact definitions. Hook inputs arrive through stdin. `PreToolUse` covers structured `request_user_input` and `request_user_input_async`; ordinary assistant questions have no separate event. The scripts make no approval decision. If a Codex release skips asynchronous hooks, make only those hook definitions synchronous after observing the issue.
 
 ## Check or remove
 
 - `<skill-python> <skill-dir>/scripts/configure.py status` checks whether the credential is present without printing it. Run it in the same user/keychain context as Codex before enabling notifications.
-- To stop notifications, remove the skill's `notify` line and optional hook definitions from `config.toml`, restoring the prior `notify` command from the backup. Restart Codex.
+- To stop notifications, remove the skill's `notify` line and hook definitions from `config.toml`, restoring the prior `notify` command from the backup. Restart Codex.
 - `<skill-python> <skill-dir>/scripts/configure.py remove` deletes the credential after configuration is detached. Revoke an exposed token with BotFather.
 
 Official references: [Codex notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications), [Codex hooks](https://learn.chatgpt.com/docs/hooks), [Telegram Bot API](https://core.telegram.org/bots/api#getupdates), [Python keyring](https://keyring.readthedocs.io/en/stable/).
