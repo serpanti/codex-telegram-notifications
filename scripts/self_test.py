@@ -225,9 +225,8 @@ class TelegramTests(unittest.TestCase):
         ]
         for context in events:
             event = {**context, "hook_event_name": "PermissionRequest"}
-            with self.subTest(context=context), patch.object(notify.sys, "stdin", io.StringIO(json.dumps(event))), patch.object(notify, "read_credential") as credential, patch.object(notify, "send_message") as sender:
+            with self.subTest(context=context), patch.object(notify.sys, "stdin", io.StringIO(json.dumps(event))), patch.object(notify, "enqueue_notification") as sender:
                 self.assertEqual(notify.main(["hook", "--hook-event", "PermissionRequest"]), 0)
-                credential.assert_not_called()
                 sender.assert_not_called()
 
     def test_actual_turn_reviewer_overrides_global_config(self):
@@ -252,18 +251,17 @@ class TelegramTests(unittest.TestCase):
             {"hook_event_name": "PreToolUse", "tool_name": "functions.request_user_input_async", "tool_input": {"questions": [{"title": "Какой вариант выбрать?"}]}},
         ]
         for event in events:
-            with self.subTest(event=event), patch.object(notify.sys, "stdin", io.StringIO(json.dumps(event))), patch.object(notify, "read_credential", return_value={"token": "123:offline", "chat_id": "23456"}), patch.object(notify, "send_message") as sender:
+            with self.subTest(event=event), patch.object(notify.sys, "stdin", io.StringIO(json.dumps(event))), patch.object(notify, "enqueue_notification") as sender:
                 self.assertEqual(notify.main(["hook", "--hook-event", event["hook_event_name"]]), 0)
                 sender.assert_called_once()
-                self.assertIn("Разрешить запись" if event["hook_event_name"] == "PermissionRequest" else "Какой вариант выбрать?", sender.call_args.args[1])
+                self.assertIn("Разрешить запись" if event["hook_event_name"] == "PermissionRequest" else "Какой вариант выбрать?", sender.call_args.args[2])
 
     def test_subagent_completion_is_silent_on_both_paths(self):
         for source in ({"subagent": {"other": "guardian"}}, {"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}}):
             event = {**self.session_event(source=source), "type": "agent-turn-complete", "hook_event_name": "SubagentStop", "last-assistant-message": "Готово"}
             self.assertIsNone(core.notification_text(event, "SubagentStop"))
-            with patch.object(notify, "read_credential") as credential, patch.object(notify, "send_message") as sender:
+            with patch.object(notify, "enqueue_notification") as sender:
                 self.assertEqual(notify.main(["main", json.dumps(event)]), 0)
-                credential.assert_not_called()
                 sender.assert_not_called()
 
     def test_main_notification_looks_up_session_by_thread_id(self):
@@ -274,7 +272,7 @@ class TelegramTests(unittest.TestCase):
             event = {"type": "agent-turn-complete", "thread-id": "thread-test", "last-assistant-message": "Готово"}
             for source, should_send in (({"subagent": {"other": "guardian"}}, False), ("vscode", True)):
                 path.write_text(json.dumps({"type": "session_meta", "payload": {"source": source}}) + "\n", encoding="utf-8")
-                with patch.object(notify, "read_credential", return_value={"token": "123:offline", "chat_id": "23456"}), patch.object(notify, "send_message") as sender:
+                with patch.object(notify, "enqueue_notification") as sender:
                     self.assertEqual(notify.main(["main", json.dumps(event)]), 0)
                     self.assertEqual(sender.call_count, int(should_send))
 
@@ -375,6 +373,12 @@ class TelegramTests(unittest.TestCase):
                 final = tomllib.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(final["notify"], again)
                 self.assertTrue(all(len(groups) == 1 for groups in final["hooks"].values()))
+
+
+def load_tests(loader, tests, pattern):
+    import service_test
+    tests.addTests(loader.loadTestsFromModule(service_test))
+    return tests
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -88,7 +89,15 @@ def remove_credential():
         ring.delete_password(SERVICE, ACCOUNT)
 
 
-def api_request(token, method, *, body=None, query=None, transport=None):
+class TelegramError(RuntimeError):
+    def __init__(self, method, code=None, retry_after=None):
+        super().__init__(f"Telegram {method} failed; check configuration and connectivity.")
+        self.code = code
+        self.retry_after = retry_after
+        self.transient = code is None or code == 408 or code == 429 or code >= 500
+
+
+def api_request(token, method, *, body=None, query=None, transport=None, timeout=8):
     if not valid_token(token):
         raise RuntimeError("Telegram bot token has an invalid format.")
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -98,12 +107,26 @@ def api_request(token, method, *, body=None, query=None, transport=None):
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json; charset=utf-8"} if data is not None else {}, method="POST" if data is not None else "GET")
     try:
         opener = transport or urllib.request.urlopen
-        with opener(request, timeout=8) as response:
+        with opener(request, timeout=timeout) as response:
             result = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            result = json.loads(error.read(65536))
+        except (ValueError, OSError):
+            result = {}
+        if not isinstance(result, dict):
+            result = {}
+        result["ok"] = False
+        result.setdefault("error_code", error.code)
     except Exception:
-        raise RuntimeError(f"Telegram {method} failed; check the token, bot state, and network.") from None
+        raise TelegramError(method) from None
     if not isinstance(result, dict) or result.get("ok") is not True:
-        raise RuntimeError(f"Telegram rejected {method}; check the bot configuration.")
+        code = result.get("error_code") if isinstance(result, dict) else None
+        code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        parameters = result.get("parameters") if isinstance(result, dict) else None
+        retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+        retry_after = min(86400, max(1, retry_after)) if isinstance(retry_after, int) else None
+        raise TelegramError(method, code, retry_after)
     return result.get("result")
 
 
@@ -276,4 +299,4 @@ def notification_text(event, kind):
 
 
 def send_message(credential, message, transport=None):
-    api_request(credential["token"], "sendMessage", body={"chat_id": credential["chat_id"], "text": message, "link_preview_options": {"is_disabled": True}}, transport=transport)
+    return api_request(credential["token"], "sendMessage", body={"chat_id": credential["chat_id"], "text": message, "link_preview_options": {"is_disabled": True}}, transport=transport)

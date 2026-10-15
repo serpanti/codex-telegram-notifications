@@ -1,13 +1,15 @@
 ---
 name: codex-telegram-notifications
-description: Send contextual main-turn completion and human-attention notifications through a Telegram bot on Windows, macOS, and Linux, suppressing subagent completions and automatic approval reviews. Use when the user wants Telegram alerts that identify the task or summarize the result.
+description: Configure, diagnose, and reliably deliver Codex Telegram alerts on Windows, macOS, and Linux, and ask scoped questions with Telegram button or text answers. Use for Telegram alerts, notification doctor checks, queued delivery, or explicitly requested questions by phone. Native Codex approval windows require a separate App Server integration.
 metadata:
   short-description: Contextual Codex alerts in Telegram
 ---
 
 # Codex Telegram Notifications
 
-This skill uses one Python implementation on Windows, macOS, and Linux. A completed main turn sends a structured message with the project, latest task, and result. Hooks send separate messages for approval routed to the user and structured user input. Subagent completions and automatic approval reviews are silent. The task and result are excerpts, not generated summaries. A completed turn does not prove the task succeeded.
+This skill uses one Python implementation on Windows, macOS, and Linux. A completed main turn queues a structured message with the project, latest task, and result. Hooks queue separate messages for approval routed to the user and structured user input. Subagent completions and automatic approval reviews are silent. The task and result are excerpts, not generated summaries. A completed turn does not prove the task succeeded.
+
+Use [references/service.md](references/service.md) for doctor checks, durable delivery, worker lifecycle, or questions answered from Telegram. No new Python dependencies are needed for these features.
 
 ## Privacy and prerequisites
 
@@ -16,12 +18,19 @@ This skill uses one Python implementation on Windows, macOS, and Linux. A comple
 - Never ask the user to paste a bot token into chat, a repository, `config.toml`, or a command-line parameter. Bootstrap prompts for it locally without echoing it, then stores the token and selected chat ID together in the OS credential store. Other processes in the same user account may still access that store; use a dedicated bot token and rotate it if exposed.
 - The user creates a bot with BotFather and sends `/start` in the intended private chat. When the chat ID is unknown, setup reads pending bot updates and asks the user to confirm the destination. Setup sends no message.
 - When the user asks to set up this skill, include Python and dependency setup in the work. Do not send a live test message without the user's authorization.
+- The queue and pending questions store message content in local SQLite under `CODEX_HOME/telegram-notifications`; tokens remain in the OS keychain. Questions use a dedicated bot in a private chat. The worker consumes incoming updates only while a skill question is pending and never removes an existing webhook.
 
 ## Configure
 
 Use [references/setup.md](references/setup.md) when installing or troubleshooting the runtime. First check for Python 3.11+; install it when needed. The user creates a bot and sends `/start` in the intended private chat. Then **one interactive command** completes the normal setup: `python <skill-dir>/scripts/bootstrap.py` (use `python3` on macOS/Linux, or an absolute 3.11+ interpreter path). Bootstrap installs dependencies in its own environment, asks for the token in a hidden prompt, discovers and confirms the private chat ID, backs up `config.toml`, and adds the root `notify` command plus notification hooks. It chains a prior `notify` automatically and preserves unrelated TOML settings. Use `--chat-id <numeric-id>` only if discovery is unavailable. Restart Codex and review and trust the new hook definitions through `/hooks`.
 
 When acting as an agent, perform all setup steps possible without the secret; use `bootstrap.py --runtime-only` if the user must run the final interactive command in their own terminal. Do not ask for the token in chat or put it into a command. Bootstrap's `--check` verifies an existing runtime without installing or prompting. The generated `notify` command uses the isolated Python's absolute path. For an existing installation, `configure.py install-hooks` adds missing hook definitions without re-entering the token or changing the existing `notify`. Other repair actions are `configure`, `status`, `print-config`, `print-hooks`, and `remove`.
+
+After setup, run `<skill-python> <skill-dir>/scripts/control.py doctor`. `doctor --network` additionally checks Telegram without sending a message. Notifications are queued before a hidden worker is started; failed network deliveries are retried automatically. On Windows, `control.py install-service` registers a least-privilege task at this user's logon so queued delivery resumes after login. `control.py start` also works on macOS/Linux; see the service reference for lifecycle and delivery guarantees.
+
+When the user asks to answer questions from Telegram, use `control.py ask --question "..." --option "..." --option "..." --timeout 900`. Omit options for a free-text answer. The command waits for the specific question and returns JSON with `status`, request/thread IDs, and the answer. For a long-running shell session, poll that same session until it finishes; do not abandon the waiting command after its initial yield. Use the answer only for that question, within existing user authorization. A timeout, cancellation, or delivery failure is not consent and must not be treated as a default choice. Ordinary clarification needs do not themselves authorize sending a new Telegram message.
+
+This explicit question flow returns through the calling command. The existing native approval and input hooks remain outgoing notifications: responding to their Telegram alerts cannot answer a native Codex window. Native questions and permissions both require a separate App Server bridge.
 
 After restarting Codex, inspect the effective root `notify`. Codex may wrap this command with `codex-computer-use` and place the Telegram command in `--previous-notify`; this preserves forwarding rather than replacing the notifier. Check that the outer executable exists: an app runtime update can leave a versioned path pointing to a removed executable, preventing completion notifications while stdin hooks still work. Run `<skill-python> <skill-dir>/scripts/configure.py repair-notify` to back up the config and restore the Telegram entry point without prompting for credentials. It unwraps removed Computer Use runtimes and preserves other prior notifiers; restart Codex to reload the changed root `notify`. On Windows, Credential Manager is tied to the user's logon context. A `status` check from an isolated agent shell can report no credential even when the normal interactive user session has it. In that case, check `status` in the same interactive session used for setup and confirm delivery with a normal completed turn before changing the credential or config.
 
@@ -39,6 +48,7 @@ The installer adds `PermissionRequest` and `PreToolUse` hooks. Legacy `SubagentS
 
 - `<skill-python> <skill-dir>/scripts/configure.py status` checks whether the credential is present without printing it. Run it in the same user/keychain context as Codex before enabling notifications.
 - To stop notifications, remove the skill's `notify` line and hook definitions from `config.toml`, restoring the prior `notify` command from the backup. Restart Codex.
+- Stop the background process with `control.py stop`; on Windows remove its logon task with `control.py uninstall-service`. A later notification or `ask` starts a worker again unless notification configuration is detached.
 - `<skill-python> <skill-dir>/scripts/configure.py remove` deletes the credential after configuration is detached. Revoke an exposed token with BotFather.
 
 Official references: [Codex notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications), [Codex hooks](https://learn.chatgpt.com/docs/hooks), [Telegram Bot API](https://core.telegram.org/bots/api#getupdates), [Python keyring](https://keyring.readthedocs.io/en/stable/).

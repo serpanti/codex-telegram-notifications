@@ -7,7 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from telegram_notify import notification_text, read_credential, send_message
+from telegram_notify import notification_text
+from worker import enqueue_notification
 
 
 def chain_previous(encoded, event_json):
@@ -54,9 +55,7 @@ def main(argv=None):
                 sys.stdout.reconfigure(encoding="utf-8")
             print(message)
             return 0
-        credential = read_credential()
-        if credential:
-            send_message(credential, message)
+        enqueue_notification(event, args.hook_event if args.kind == "hook" else "main", message)
     except Exception:
         # No event, token, URL, or exception detail may reach Codex logs.
         pass
