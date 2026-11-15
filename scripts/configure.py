@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from telegram_notify import discover_private_chats, read_credential, remove_credential, save_credential, secure_keyring, valid_chat_id, valid_token
 
 HOOKS = (
-    ("SubagentStop", ".*"),
     ("PermissionRequest", ".*"),
     ("PreToolUse", ".*request_user_input(_async)?$"),
 )
@@ -118,6 +117,37 @@ def write_config(path, new_text):
     return path, backup
 
 
+def previous_notifier(command):
+    """Unwrap this notifier and removed Computer Use runtime wrappers.
+
+    Preserve other notifiers. A missing, versioned Computer Use executable
+    must not become a dependency of Telegram delivery or cause recursive chains.
+    """
+    notify_path = Path(__file__).with_name("notify.py").resolve()
+    for _ in range(16):
+        if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
+            raise RuntimeError("Existing notify chain is invalid; config was not changed.")
+        if len(command) >= 3 and Path(command[1]).resolve() == notify_path and command[2] == "main":
+            if "--chain-command" not in command:
+                return None
+            try:
+                index = command.index("--chain-command")
+                command = json.loads(base64.b64decode(command[index + 1], validate=True).decode("utf-8"))
+            except (IndexError, ValueError, UnicodeError) as exc:
+                raise RuntimeError("Existing Telegram notifier has an invalid chain; config was not changed.") from exc
+        elif Path(command[0]).name.lower() == "codex-computer-use.exe" and Path(command[0]).is_absolute() and not Path(command[0]).exists():
+            if "--previous-notify" not in command:
+                return None
+            try:
+                index = command.index("--previous-notify")
+                command = json.loads(command[index + 1])
+            except (IndexError, ValueError) as exc:
+                raise RuntimeError("Existing Computer Use notifier has an invalid chain; config was not changed.") from exc
+        else:
+            return command
+    raise RuntimeError("Existing notify chain is too deeply nested; config was not changed.")
+
+
 def install_config():
     """Preserve all other TOML settings and chain any previous root notifier."""
     import tomlkit
@@ -130,17 +160,7 @@ def install_config():
         command = list(previous) if not isinstance(previous, str) else []
         if not command or not all(isinstance(part, str) for part in command):
             raise RuntimeError("Existing top-level notify is not a string array; config was not changed.")
-        notify_path = Path(__file__).with_name("notify.py").resolve()
-        if len(command) >= 3 and Path(command[1]).resolve() == notify_path and command[2] == "main":
-            if "--chain-command" in command:
-                index = command.index("--chain-command")
-                try:
-                    command = json.loads(base64.b64decode(command[index + 1], validate=True).decode("utf-8"))
-                except (IndexError, ValueError) as exc:
-                    raise RuntimeError("Existing Telegram notifier has an invalid chain; config was not changed.") from exc
-            else:
-                command = None
-        previous = command
+        previous = previous_notifier(command)
 
     updated = python_command("main")
     if previous:
@@ -199,7 +219,7 @@ def configure(chat_id):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "install-hooks", "configure", "status", "print-config", "print-hooks", "remove"))
+    parser.add_argument("action", choices=("install", "install-hooks", "repair-notify", "configure", "status", "print-config", "print-hooks", "remove"))
     parser.add_argument("--chat-id")
     parser.add_argument("--chain-existing", action="store_true")
     args = parser.parse_args(argv)
@@ -214,6 +234,12 @@ def main(argv=None):
                 print(f"Previous config saved at {backup}.")
             print("Review and trust the new hooks in Codex /hooks after restart.")
             print("Restart Codex to apply the change.")
+        elif args.action == "repair-notify":
+            path, backup = install_config()
+            print(f"Telegram completion notifier repaired in {path}.")
+            if backup:
+                print(f"Previous config saved at {backup}.")
+            print("Restart Codex to reload notify. No credentials were changed or messages sent.")
         elif args.action == "install-hooks":
             path, backup = install_hooks()
             print(f"Telegram hooks configured in {path}.")

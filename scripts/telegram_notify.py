@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -87,7 +89,15 @@ def remove_credential():
         ring.delete_password(SERVICE, ACCOUNT)
 
 
-def api_request(token, method, *, body=None, query=None, transport=None):
+class TelegramError(RuntimeError):
+    def __init__(self, method, code=None, retry_after=None):
+        super().__init__(f"Telegram {method} failed; check configuration and connectivity.")
+        self.code = code
+        self.retry_after = retry_after
+        self.transient = code is None or code == 408 or code == 429 or code >= 500
+
+
+def api_request(token, method, *, body=None, query=None, transport=None, timeout=8):
     if not valid_token(token):
         raise RuntimeError("Telegram bot token has an invalid format.")
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -97,12 +107,26 @@ def api_request(token, method, *, body=None, query=None, transport=None):
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json; charset=utf-8"} if data is not None else {}, method="POST" if data is not None else "GET")
     try:
         opener = transport or urllib.request.urlopen
-        with opener(request, timeout=8) as response:
+        with opener(request, timeout=timeout) as response:
             result = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            result = json.loads(error.read(65536))
+        except (ValueError, OSError):
+            result = {}
+        if not isinstance(result, dict):
+            result = {}
+        result["ok"] = False
+        result.setdefault("error_code", error.code)
     except Exception:
-        raise RuntimeError(f"Telegram {method} failed; check the token, bot state, and network.") from None
+        raise TelegramError(method) from None
     if not isinstance(result, dict) or result.get("ok") is not True:
-        raise RuntimeError(f"Telegram rejected {method}; check the bot configuration.")
+        code = result.get("error_code") if isinstance(result, dict) else None
+        code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        parameters = result.get("parameters") if isinstance(result, dict) else None
+        retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+        retry_after = min(86400, max(1, retry_after)) if isinstance(retry_after, int) else None
+        raise TelegramError(method, code, retry_after)
     return result.get("result")
 
 
@@ -176,12 +200,72 @@ def task_excerpt(value):
     return excerpt(clean, 450)
 
 
+def session_context(event, *, include_turn=False):
+    """Read routing metadata only; never put transcript contents in an alert.
+
+    The app can override config.toml per chat, so the recorded turn context is
+    the authority for the reviewer. Missing metadata does not prove a human wait.
+    """
+    transcript = event.get("transcript_path")
+    if isinstance(transcript, str) and transcript:
+        path = Path(transcript)
+    else:
+        session_id = event.get("thread-id") or event.get("session_id")
+        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+            return {}, {}
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        try:
+            path = next((home / "sessions").glob(f"**/rollout-*-{session_id}.jsonl"), None)
+            if path is None:
+                path = next((home / "archived_sessions").glob(f"**/rollout-*-{session_id}.jsonl"), None)
+        except OSError:
+            return {}, {}
+        if path is None:
+            return {}, {}
+    metadata, context = {}, {}
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                # Skip assistant text and tool outputs without decoding them.
+                prefix = line[:160]
+                if '"session_meta"' not in prefix and (not include_turn or '"turn_context"' not in prefix):
+                    continue
+                try:
+                    record = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
+                    continue
+                if record.get("type") == "session_meta":
+                    metadata = record["payload"]
+                    if not include_turn:
+                        break
+                elif include_turn and record.get("type") == "turn_context":
+                    context = record["payload"]
+    except (OSError, UnicodeError):
+        return {}, {}
+    return metadata, context
+
+
+def is_subagent(event):
+    metadata, _ = session_context(event)
+    source = metadata.get("source", event.get("source"))
+    return isinstance(source, dict) and "subagent" in source
+
+
+def approval_is_for_user(event):
+    _, context = session_context(event, include_turn=True)
+    if event.get("turn_id") and event["turn_id"] != context.get("turn_id"):
+        return False
+    return context.get("approvals_reviewer") == "user" and context.get("approval_policy") not in (None, "never")
+
+
 def notification_text(event, kind):
     if not isinstance(event, dict):
         return None
     project = project_name(event)
     if kind == "main":
-        if event.get("type") != "agent-turn-complete":
+        if event.get("type") != "agent-turn-complete" or is_subagent(event):
             return None
         inputs = event.get("input-messages", [])
         task = ""
@@ -194,9 +278,11 @@ def notification_text(event, kind):
     if event.get("hook_event_name") != kind:
         return None
     if kind == "SubagentStop":
-        result = excerpt(event.get("last_assistant_message"), 900)
-        return "\n".join(("🤖 Codex: подагент завершил ход", f"Проект: {project}", f"Итог: {result or 'Ответ не указан'}"))
+        # Older installations still invoke this hook. Keep it a silent no-op.
+        return None
     if kind == "PermissionRequest":
+        if not approval_is_for_user(event):
+            return None
         tool = event.get("tool_input")
         description = excerpt(tool.get("description") if isinstance(tool, dict) else None, 450) or excerpt(event.get("tool_name"), 160) or "Действие не указано"
         return "\n".join(("⚠️ Codex: требуется разрешение", f"Проект: {project}", f"Действие: {description}", "Ожидается: решение в Codex"))
@@ -207,10 +293,10 @@ def notification_text(event, kind):
         tool = event.get("tool_input")
         questions = tool.get("questions") if isinstance(tool, dict) else None
         first = questions[0] if isinstance(questions, list) and questions else None
-        question = excerpt(first.get("title") if isinstance(first, dict) else None, 450) or "Вопрос не указан"
+        question = excerpt((first.get("question") or first.get("title")) if isinstance(first, dict) else None, 450) or "Вопрос не указан"
         return "\n".join(("❓ Codex: нужен ответ", f"Проект: {project}", f"Вопрос: {question}", "Ожидается: ответ в Codex"))
     return None
 
 
 def send_message(credential, message, transport=None):
-    api_request(credential["token"], "sendMessage", body={"chat_id": credential["chat_id"], "text": message, "link_preview_options": {"is_disabled": True}}, transport=transport)
+    return api_request(credential["token"], "sendMessage", body={"chat_id": credential["chat_id"], "text": message, "link_preview_options": {"is_disabled": True}}, transport=transport)

@@ -7,7 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from telegram_notify import notification_text, read_credential, send_message
+from telegram_notify import notification_text
+from worker import enqueue_notification
 
 
 def chain_previous(encoded, event_json):
@@ -30,7 +31,16 @@ def main(argv=None):
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("event_json", nargs="?")
     args = parser.parse_args(argv)
-    event_json = sys.stdin.read() if args.kind == "hook" else args.event_json
+    try:
+        if args.kind == "hook":
+            # Codex sends UTF-8 bytes. Windows pipe defaults can be cp1251 even
+            # when the JSON labels and the Telegram HTTP request use UTF-8.
+            buffer = getattr(sys.stdin, "buffer", None)
+            event_json = buffer.read().decode("utf-8-sig") if buffer is not None else sys.stdin.read()
+        else:
+            event_json = args.event_json
+    except (UnicodeError, OSError):
+        return 0
     if not event_json:
         return 0
     if args.chain_command and args.kind == "main" and not args.preview:
@@ -45,9 +55,7 @@ def main(argv=None):
                 sys.stdout.reconfigure(encoding="utf-8")
             print(message)
             return 0
-        credential = read_credential()
-        if credential:
-            send_message(credential, message)
+        enqueue_notification(event, args.hook_event if args.kind == "hook" else "main", message)
     except Exception:
         # No event, token, URL, or exception detail may reach Codex logs.
         pass
